@@ -1,0 +1,102 @@
+#!/bin/bash
+
+set -eu -o pipefail
+
+release_dir="$( cd "$( dirname "$0" )" && cd .. && pwd )"
+
+green='\033[32m'
+yellow='\033[33m'
+red='\033[31m'
+nc='\033[0m'
+
+usage() {
+  >&2 cat <<EOF
+SYNOPSIS:
+    Builds a Docker image for testing changes to the terraform-resource
+USAGE:
+    $0 <MANDATORY ARGUMENTS> [OPTIONAL ARGUMENTS]
+MANDATORY ARGUMENTS:
+    --image-name <name>        Name of the Docker image you'd like to build, e.g. ljfranklin/terraform-resource:PR-test
+    --terraform-tag <tag>      GitHub tag of the terraform version to fetch, patch, compile and add to the image.
+OPTIONAL ARGUMENTS:
+    -h                         Prints this usage text.
+EOF
+  exit 1
+}
+
+if [ "$#" = 0 ]; then
+  >&2 echo -e "${red}No arguments given!${nc}"
+  usage
+fi
+
+image_name=""
+tag=""
+set +u
+while true ; do
+  if [ "$#" = 0 ]; then
+    break
+  fi
+  case "$1" in
+    --image-name)
+      if [ -z "$2" ]; then
+        >&2 echo -e "${red}--image-name requires an argument!${nc}"
+        exit 1
+      fi
+      image_name="$2"
+      shift 2
+      ;;
+    --terraform-tag)
+      tag="$2"
+      shift 2
+      ;;
+    -h)
+      usage
+      ;;
+    *)
+      >&2 echo -e "${red}Unrecognized argument '$1'!${nc}"
+      usage
+      ;;
+  esac
+done
+set -u
+
+if [ -z "${image_name}" ]; then
+  >&2 echo -e "${red}Missing required flag --image-name <name>!${nc}"
+  usage
+fi
+
+tmpdir="$(mktemp -d /tmp/terraform-resource-docker.XXXXXX)"
+trap "{ rm -rf ${tmpdir}; }" EXIT
+
+pushd "${tmpdir}" > /dev/null
+
+  if [[ -z $tag ]]; then
+	tag=$(curl https://api.github.com/repos/hashicorp/terraform/releases/latest | jq -r .tag_name)
+  fi
+  pushd $(mktemp -d)
+  export GOPATH=$PWD
+  export PATH=$GOPATH/bin:$PATH
+  mkdir src pkg bin
+  cd src
+  mkdir -p github.com/hashicorp
+  cd github.com/hashicorp
+  git clone git@github.com:hashicorp/terraform.git
+  cd terraform
+  git checkout $tag
+  wget https://raw.githubusercontent.com/pdelagrave/terraform/master/releng.patch
+  patch -p1 < releng.patch
+  make dev
+  XC_OS="linux" XC_ARCH="amd64" make bin
+  popd
+  mkdir terraform
+  mv $GOPATH/bin/terraform ./terraform/
+
+  echo "Compiling terraform-resource binaries..."
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "${release_dir}/scripts/build" "$PWD" > /dev/null
+
+  echo "Building docker image '${image_name}'..."
+  cp "${release_dir}/docker-prod/Dockerfile" .
+  docker build -t "${image_name}" .
+popd > /dev/null
+
+echo -e "${green}Successfully created docker image '${image_name}'!"
